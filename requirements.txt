@@ -1,0 +1,8 @@
+# Core packet parsing - reads .pcap / .pcapng files
+scapy>=2.5.0
+
+# Colored terminal output (works on Windows and Linux)
+colorama>=0.4.6
+
+# Aligned tables for the plain-text reports
+tabulate>=0.9.0

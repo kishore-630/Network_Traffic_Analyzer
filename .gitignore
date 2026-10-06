@@ -1,0 +1,26 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Generated output - every run creates new timestamped files
+output/*.csv
+reports/*.txt
+
+# Capture files can be large or sensitive: keep the folder, not the traffic.
+# Comment the next line out if you want to commit small demo captures.
+pcaps/*.pcap
+pcaps/*.pcapng
+pcaps/*.cap
+
+# Editors and OS noise
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
