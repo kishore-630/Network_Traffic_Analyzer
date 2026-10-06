@@ -16,7 +16,7 @@ from typing import Dict, List
 # ═══════════════════════════════════════════════════════════════════
 
 TOOL_NAME: str = "Network Traffic Analyzer"
-TOOL_VERSION: str = "2.1.0"
+TOOL_VERSION: str = "2.2.0"
 # Shown in the splash header, under the product name.
 AUTHOR: str = "GURRALA KISHORE KUMAR"
 
@@ -30,6 +30,23 @@ MIN_PYTHON: str = "3.9"
 OUTPUT_FOLDER: str = "output"
 REPORTS_FOLDER: str = "reports"
 PCAPS_FOLDER: str = "pcaps"
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  2b. Live capture defaults (used by the online mode)
+# ═══════════════════════════════════════════════════════════════════
+
+# How many packets a live capture records before it stops by itself
+# (overridable with `--count`).
+LIVE_DEFAULT_COUNT: int = 200
+
+# Safety net in seconds: if the interface stays completely silent the
+# capture still stops instead of running forever (overridable with
+# `--timeout`). Use 0 to disable the limit.
+LIVE_DEFAULT_TIMEOUT: int = 30
+
+# Prefix of the file a live capture is written to inside ``pcaps/``.
+LIVE_CAPTURE_PREFIX: str = "live"
 
 
 # ═══════════════════════════════════════════════════════════════════

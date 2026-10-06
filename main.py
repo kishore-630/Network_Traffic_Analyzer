@@ -1,16 +1,23 @@
-"""Network Traffic Analyzer - command-line entry point.
+"""Network Traffic Analyzer - command line entry point.
 
 This file only *orchestrates* the work:
 
 1. parse the command line,
-2. load the capture,
+2. load the capture (from a file, or live from an interface),
 3. compute statistics and anomalies,
 4. show them, or save a report.
+
+The tool works in two modes:
+
+* **offline** - analyze a ``.pcap`` / ``.pcapng`` file that already exists,
+* **online**  - record live traffic from a network interface with
+  ``--live``, then analyze exactly the same way.
 
 All the interesting logic lives in the ``analyzer`` package:
 
 ============================  =========================================
 ``analyzer/utils.py``         loading captures, formatting helpers
+``analyzer/live.py``          live capture from a network interface
 ``analyzer/stats.py``         one pass over the packets, many metrics
 ``analyzer/anomalies.py``     rule-based detection with severities
 ``analyzer/ui.py``            all colors, glyphs and tables
@@ -19,9 +26,13 @@ All the interesting logic lives in the ``analyzer`` package:
 
 Usage
 -----
-Interactive menu (the default)::
+Offline, interactive menu (the default)::
 
     python main.py pcaps/sample.pcap
+
+Online, record then analyze::
+
+    python main.py --live -i eth0 -c 200 --full
 
 Ask for the path, then show the menu::
 
@@ -43,6 +54,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import config
 from analyzer import ui
 from analyzer.anomalies import Finding, detect_anomalies
+from analyzer.live import (
+    LiveCaptureError,
+    capture_live,
+    format_interface_list,
+    list_interfaces,
+    resolve_interface,
+    save_live_capture,
+)
 from analyzer.report import save_all
 from analyzer.stats import compute_stats
 from analyzer.utils import (
@@ -80,18 +99,52 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="main.py",
         description=(f"{config.TOOL_NAME} v{config.TOOL_VERSION} - "
-                     "pcap insights and anomaly detection."),
+                     "offline pcap analysis, live capture and anomaly "
+                     "detection."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=("examples:\n"
+                "  # offline - analyze a capture that already exists\n"
                 "  python main.py pcaps/sample.pcap              interactive menu\n"
                 "  python main.py pcaps/sample.pcap --full        stats + anomalies\n"
                 "  python main.py pcaps/sample.pcap --no-save     look, write nothing\n"
+                "  python main.py --list-interfaces               show capture interfaces\n"
+                "\n"
+                "  # online - record live traffic, then analyze it\n"
+                "  python main.py --live                          pick the interface by number\n"
+                "  python main.py --live -i eth0 -c 200 --full    record 200 packets\n"
+                "  python main.py --live -i eth0 --filter 'port 443'\n"
+                "\n"
                 "  python main.py --version\n"),
     )
     parser.add_argument("pcap", nargs="?",
                         help="path to the .pcap / .pcapng file to analyze")
     parser.add_argument("-v", "--version", action="version",
                         version=f"{config.TOOL_NAME} {config.TOOL_VERSION}")
+
+    # ── Online / live capture ─────────────────────────────────────
+    live = parser.add_argument_group(
+        "online (live) capture",
+        "record packets straight from a network interface",
+    )
+    live.add_argument("--live", action="store_true",
+                      help="record from an interface instead of reading a file")
+    live.add_argument("-i", "--interface", metavar="NAME",
+                      help="interface to record from (e.g. eth0, wlan0, en0)")
+    live.add_argument("-c", "--count", type=int,
+                      default=config.LIVE_DEFAULT_COUNT, metavar="N",
+                      help=("stop after N packets "
+                            f"(default: {config.LIVE_DEFAULT_COUNT}, "
+                            "0 = no limit)"))
+    live.add_argument("--timeout", type=int,
+                      default=config.LIVE_DEFAULT_TIMEOUT, metavar="SEC",
+                      help=("stop after SEC seconds without traffic "
+                            f"(default: {config.LIVE_DEFAULT_TIMEOUT}, "
+                            "0 = no limit)"))
+    live.add_argument("--filter", dest="bpf_filter", metavar="EXPR",
+                      help="tcpdump-style filter, e.g. \"port 443\"")
+    live.add_argument("--list-interfaces", action="store_true",
+                      help="list the interfaces available for live capture "
+                           "and exit")
 
     # These three are mutually exclusive: exactly one mode can be requested.
     group = parser.add_mutually_exclusive_group()
@@ -203,6 +256,187 @@ def save_results(pcap_path: str, stats: Dict[str, Any],
     ui.success(f"Text report saved  {ui.GLYPH['arrow']} {report_path}")
     ui.success(f"CSV summary saved  {ui.GLYPH['arrow']} {csv_path}")
     return 0
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  Online (live) capture
+# ═══════════════════════════════════════════════════════════════════
+
+def list_interfaces_and_exit() -> int:
+    """Print every interface available for a live capture.
+
+    Returns:
+        Process exit code.
+    """
+    interfaces = list_interfaces()
+    print()
+    ui.info(f"Interfaces available for live capture "
+            f"({len(interfaces)} found):")
+    print(ui.C_DIM + format_interface_list(interfaces) + ui.Style.RESET_ALL)
+    print()
+    ui.info(f"Record with:  python main.py --live -i "
+            f"<name> -c {config.LIVE_DEFAULT_COUNT}")
+    ui.warning("Capture needs root/administrator rights, and an interface "
+               "that is Up.")
+    return 0
+
+
+def choose_interface() -> Optional[str]:
+    """Show the interface list and let the user pick one by number.
+
+    Returns:
+        The chosen interface name, or ``None`` if nothing was chosen.
+    """
+    interfaces = list_interfaces()
+    print()
+    ui.info(f"Which interface should I record from? "
+            f"({len(interfaces)} found)")
+    print(ui.C_DIM + format_interface_list(interfaces) + ui.Style.RESET_ALL)
+    print()
+
+    if not interfaces:
+        ui.error("The operating system reported no network interface.")
+        return None
+
+    answer = ui.ask(f"Interface number [1-{len(interfaces)}] "
+                    f"(0 = cancel): ")
+    if not answer:
+        return None
+
+    try:
+        index = int(answer)
+    except ValueError:
+        ui.warning(f"'{answer}' is not a number.")
+        return None
+
+    if not 1 <= index <= len(interfaces):
+        ui.warning(f"Pick a number between 1 and {len(interfaces)}.")
+        return None
+    return interfaces[index - 1][0]
+
+
+def _progress_printer(count: int):
+    """Build a callback that draws a one-line live packet counter.
+
+    Args:
+        count: The packet target, used to scale the progress bar.
+
+    Returns:
+        A callable ``(seen, total) -> None`` that redraws in place.
+    """
+    bar_width = 28
+    # The block glyphs are not part of the ASCII fallback set, so pick them
+    # only when the console can actually print them.
+    full_glyph, empty_glyph = ("█", "░") if ui.UNI else ("#", ".")
+
+    def report(seen: int, total: int) -> None:
+        if total > 0:
+            filled = min(bar_width, int(bar_width * seen / total))
+            bar = full_glyph * filled + empty_glyph * (bar_width - filled)
+            text = f"  recording {bar} {seen}/{total} packets"
+        else:
+            text = f"  recording {seen} packets"
+        # \r + pad-to-width redraws in place without spamming new lines.
+        sys.stdout.write("\r" + text.ljust(ui.WIDTH))
+        sys.stdout.flush()
+
+    return report
+
+
+def run_live(args: argparse.Namespace) -> int:
+    """Record live traffic, then analyze it exactly like a saved file.
+
+    Args:
+        args: The parsed command-line namespace.
+
+    Returns:
+        Process exit code (``0`` = fine, ``1`` = the capture could not
+        start).
+    """
+    # 1. Which interface?
+    interface = args.interface
+    if not interface:
+        interface = choose_interface()
+        if not interface:
+            ui.warning("No interface chosen - leaving.")
+            return 1
+
+    try:
+        resolve_interface(interface)
+    except LiveCaptureError as exc:
+        ui.error(str(exc))
+        return 1
+
+    if interface in ("any", "lo", "loopback"):
+        ui.warning("'{interface}' is a virtual interface. A capture there "
+                   "often records nothing - pick a real interface such as "
+                   "eth0 or wlan0.".format(interface=interface))
+
+    # 2. Record.
+    target = "endless" if not args.count else str(args.count)
+    print()
+    ui.info(f"Recording from {ui.C_ACCENT}{interface}"
+            f"{ui.Style.RESET_ALL} {ui.GLYPH['dot']} target {target} packets "
+            f"{ui.GLYPH['dot']} stop after {args.timeout}s of silence")
+    if args.bpf_filter:
+        ui.info(f"Filter: {args.bpf_filter}")
+    ui.info("Generate traffic now (open a page, ping something). "
+            f"Press {ui.GLYPH['dot']} Ctrl+C to stop early.")
+    print()
+
+    try:
+        packets = capture_live(
+            interface=interface,
+            count=args.count,
+            timeout=args.timeout,
+            bpf_filter=args.bpf_filter,
+            on_packet=_progress_printer(args.count),
+        )
+    except KeyboardInterrupt:
+        # capture_live re-raises this; nothing was returned, so treat the
+        # capture as empty and let the shared "0 packets" path report it.
+        sys.stdout.write("\r" + " " * ui.WIDTH + "\r")
+        sys.stdout.flush()
+        ui.warning("Stopped by Ctrl+C.")
+        packets = []
+    except LiveCaptureError as exc:
+        sys.stdout.write("\r" + " " * ui.WIDTH + "\r")
+        sys.stdout.flush()
+        ui.error(str(exc))
+        return 1
+
+    sys.stdout.write("\r" + " " * ui.WIDTH + "\r")
+    sys.stdout.flush()
+
+    if not packets:
+        ui.warning("The capture recorded 0 packets.")
+        ui.info(f"Nothing is wrong with the analyzer. Check the interface is "
+                f"Up, that you have permission to capture, and that traffic "
+                f"was actually flowing while it recorded.")
+        return 0
+
+    ui.success(f"Recorded {len(packets)} packets from {interface}.")
+
+    # 3. Archive the capture so it can be re-analyzed offline later.
+    ensure_output_folders(config.OUTPUT_FOLDER, config.REPORTS_FOLDER,
+                          config.PCAPS_FOLDER)
+    saved_path = save_live_capture(packets)
+    if saved_path:
+        ui.success(f"Live capture saved {ui.GLYPH['arrow']} {saved_path}")
+    else:
+        ui.warning("Could not write the capture to disk - "
+                   "the analysis below still runs.")
+
+    label = saved_path or f"live capture on {interface}"
+
+    # 4. Analyze it with the exact same pipeline as an offline file.
+    if args.anomalies_only:
+        return run_one_shot(label, packets, "anomalies", not args.no_save)
+    if args.stats_only:
+        return run_one_shot(label, packets, "stats", not args.no_save)
+    if args.full:
+        return run_one_shot(label, packets, "full", not args.no_save)
+    return run_interactive(label, packets, do_save=not args.no_save)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -330,7 +564,18 @@ def main(argv: Optional[List[str]] = None) -> int:
     args = parse_args(argv)
     ui.print_banner()
 
-    # 1. Which capture? From the command line, or by asking.
+    # 0. "Which interface can I even record from?" - answer and exit.
+    if args.list_interfaces:
+        return list_interfaces_and_exit()
+
+    # 1. Online mode: record from an interface, then analyze it in memory.
+    if args.live:
+        if args.pcap:
+            ui.warning("A capture file was also given; --live takes precedence "
+                       "and the file argument is ignored.")
+        return run_live(args)
+
+    # 2. Offline mode: which capture file? From the command line, or by asking.
     pcap_path = args.pcap
     if not pcap_path:
         pcap_path = ask_for_path()
@@ -338,11 +583,11 @@ def main(argv: Optional[List[str]] = None) -> int:
             ui.error("No capture file given - nothing to analyze.")
             return 1
 
-    # 2. Make sure output/, reports/ and pcaps/ exist.
+    # 3. Make sure output/, reports/ and pcaps/ exist.
     ensure_output_folders(config.OUTPUT_FOLDER, config.REPORTS_FOLDER,
                           config.PCAPS_FOLDER)
 
-    # 3. Load the packets (friendly errors, no traceback for beginners).
+    # 4. Load the packets (friendly errors, no traceback for beginners).
     packets = load_capture(pcap_path)
     if packets is None:
         # load_capture already printed exactly what went wrong.
@@ -350,7 +595,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     if not packets:
         return 0  # an empty capture was already reported
 
-    # 4. One-shot modes, or the interactive menu (the default).
+    # 5. One-shot modes, or the interactive menu (the default).
     if args.anomalies_only:
         return run_one_shot(pcap_path, packets, "anomalies", not args.no_save)
     if args.stats_only:

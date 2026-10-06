@@ -6,3 +6,12 @@ colorama>=0.4.6
 
 # Aligned tables for the plain-text reports
 tabulate>=0.9.0
+
+# ── Extra, NOT installable via pip ─────────────────────────────────
+# The online (--live) mode also needs a capture backend, which is a
+# system package rather than a Python one:
+#   Windows : Npcap, installed with "WinPcap API support" ticked
+#             https://npcap.com/dist/
+#   Linux   : sudo apt install libpcap0.8      (pre-installed on Kali)
+#   macOS   : ships with the system
+# Offline analysis of an existing .pcap needs none of these.
